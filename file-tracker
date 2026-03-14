@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""file-tracker: See which files Claude Code plans will edit, detect conflicts.
+
+Shows only plans created since the last git commit in their project.
+
+Usage:
+  file-tracker        Show plans and check for conflicts
+  file-tracker help   Show this help
+"""
+
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from collections import defaultdict
+from pathlib import Path
+
+PLANS_DIR = Path.home() / ".claude" / "plans"
+
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+MAGENTA = "\033[35m"
+RESET = "\033[0m"
+
+FILE_EXTENSIONS = {
+    "swift", "ts", "tsx", "js", "jsx", "py", "go", "rs", "java", "kt",
+    "json", "yaml", "yml", "toml", "css", "html", "rb", "vue", "svelte",
+    "h", "m", "c", "cpp", "cc", "hpp", "xml", "plist", "sh", "zsh",
+    "graphql", "proto", "sql", "tf", "dockerfile",
+}
+
+
+# ── Git helpers ──────────────────────────────────────────────
+
+
+def discover_git_repos():
+    """Find git repos by scanning home directory (2 levels deep)."""
+    candidates = set()
+    home = Path.home()
+    for d in home.iterdir():
+        try:
+            if d.name.startswith(".") or not d.is_dir():
+                continue
+            if (d / ".git").exists():
+                candidates.add(str(d))
+            else:
+                for dd in d.iterdir():
+                    if dd.is_dir() and (dd / ".git").exists():
+                        candidates.add(str(dd))
+        except PermissionError:
+            continue
+
+    repos = []
+    for path in candidates:
+        try:
+            result = subprocess.run(
+                ["git", "-C", path, "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                root = result.stdout.strip()
+                if root not in repos:
+                    repos.append(root)
+        except Exception:
+            continue
+    return repos
+
+
+def get_last_commit_time(repo):
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo, "log", "-1", "--format=%cI"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return datetime.fromisoformat(result.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
+def find_repo_for_files(files, repos):
+    for repo in repos:
+        for fp in files:
+            if "/" in fp:
+                if os.path.exists(os.path.join(repo, fp)):
+                    return repo
+    for repo in repos:
+        for fp in files:
+            if "/" not in fp:
+                try:
+                    result = subprocess.run(
+                        ["find", repo, "-name", fp, "-maxdepth", 5, "-print", "-quit"],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    if result.stdout.strip():
+                        return repo
+                except Exception:
+                    continue
+    return None
+
+
+# ── Time helpers ─────────────────────────────────────────────
+
+
+def time_ago_dt(dt):
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - dt
+    secs = int(delta.total_seconds())
+    if secs < 0:
+        return "just now"
+    if secs < 60:
+        return f"{secs}s ago"
+    elif secs < 3600:
+        return f"{secs // 60}m ago"
+    elif secs < 86400:
+        return f"{secs // 3600}h ago"
+    else:
+        return f"{secs // 86400}d ago"
+
+
+# ── Plan parsing ─────────────────────────────────────────────
+
+
+def is_file_path(text):
+    if "." not in text:
+        return False
+    ext = text.rsplit(".", 1)[-1].lower().rstrip(",;:)")
+    if ext not in FILE_EXTENSIONS:
+        return False
+    code_markers = ["==", "!=", "&&", "||", "()", "{}", " = ", "->", "??", "//", "<<", ">>"]
+    if any(op in text for op in code_markers):
+        return False
+    if " " in text:
+        return False
+    basename = text.rsplit("/", 1)[-1]
+    name_part = basename.rsplit(".", 1)[0]
+    if len(name_part) < 2:
+        return False
+    return True
+
+
+def extract_files_from_plan(content):
+    raw_files = set()
+    in_code_block = False
+    for line in content.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block:
+            continue
+        for match in re.finditer(r"`([^`]+)`", line):
+            text = match.group(1)
+            if is_file_path(text):
+                raw_files.add(text)
+    by_basename = defaultdict(list)
+    for fp in raw_files:
+        bn = normalize_filename(fp)
+        by_basename[bn].append(fp)
+    files = set()
+    for bn, paths in by_basename.items():
+        files.add(max(paths, key=len))
+    return files
+
+
+def normalize_filename(path):
+    return path.rsplit("/", 1)[-1]
+
+
+# ── Data loading ─────────────────────────────────────────────
+
+
+def get_plans():
+    if not PLANS_DIR.exists():
+        return {}, None
+
+    repos = discover_git_repos()
+
+    repo_commit_times = {}
+    for repo in repos:
+        t = get_last_commit_time(repo)
+        if t:
+            repo_commit_times[repo] = t
+
+    plans = {}
+    cutoff_used = None
+
+    all_plan_files = sorted(
+        PLANS_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+
+    for f in all_plan_files:
+        mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
+        content = f.read_text(errors="replace")
+        files = extract_files_from_plan(content)
+        if not files:
+            continue
+
+        repo = find_repo_for_files(files, repos)
+        cutoff = repo_commit_times.get(repo) if repo else None
+
+        if cutoff:
+            if cutoff.tzinfo is None:
+                cutoff = cutoff.replace(tzinfo=timezone.utc)
+            if mtime <= cutoff:
+                continue
+            cutoff_used = cutoff
+        elif repo is None:
+            now = datetime.now(timezone.utc)
+            if (now - mtime).total_seconds() > 86400:
+                continue
+
+        title = f.stem
+        for line in content.split("\n"):
+            if line.startswith("# "):
+                title = line[2:].strip()
+                break
+
+        plans[f.stem] = {
+            "title": title,
+            "files": files,
+            "mtime": mtime,
+        }
+
+    return plans, cutoff_used
+
+
+# ── Display ──────────────────────────────────────────────────
+
+
+def show_plans(plans, cutoff):
+    if not plans:
+        if cutoff:
+            print(f"  {DIM}No plans since last commit ({time_ago_dt(cutoff)}).{RESET}")
+        else:
+            print(f"  {DIM}No plans with file references found.{RESET}")
+        return
+
+    for i, (name, data) in enumerate(plans.items()):
+        label = chr(65 + i)
+        age = time_ago_dt(data["mtime"])
+        title = data["title"]
+        n = len(data["files"])
+        print(f"\n  {MAGENTA}[{label}]{RESET} {BOLD}{title}{RESET}  {DIM}({age}, {n} file{'s' if n != 1 else ''}){RESET}")
+        for fp in sorted(data["files"]):
+            print(f"      {fp}")
+
+
+def check_conflicts(plans):
+    plan_files = {}
+    for i, (name, data) in enumerate(plans.items()):
+        label = chr(65 + i)
+        plan_files[label] = {
+            "basenames": {normalize_filename(fp) for fp in data["files"]},
+            "title": data["title"],
+        }
+
+    if len(plan_files) >= 2:
+        plan_labels = sorted(plan_files.keys())
+        for i, l1 in enumerate(plan_labels):
+            for l2 in plan_labels[i + 1:]:
+                shared = plan_files[l1]["basenames"] & plan_files[l2]["basenames"]
+                t1 = plan_files[l1]["title"]
+                t2 = plan_files[l2]["title"]
+                if shared:
+                    print(f"\n  {RED}Plan [{l1}] + Plan [{l2}]: CONFLICT{RESET}")
+                    print(f"    {DIM}{t1}  +  {t2}{RESET}")
+                    print(f"    Shared: {', '.join(sorted(shared))}")
+                else:
+                    print(f"\n  {GREEN}Plan [{l1}] + Plan [{l2}]: No shared files — safe to run in parallel.{RESET}")
+    elif len(plan_files) == 1:
+        print(f"\n  {DIM}Only one plan — nothing to compare.{RESET}")
+    else:
+        print(f"\n  {DIM}No plans to compare.{RESET}")
+
+    print()
+
+
+# ── Main ─────────────────────────────────────────────────────
+
+
+def main():
+    args = sys.argv[1:]
+    cmd = args[0] if args else "show"
+
+    if cmd in ("show", "list", "ls"):
+        plans, cutoff = get_plans()
+
+        print(f"\n{BOLD}FILE TRACKER{RESET}")
+        print("=" * 42)
+
+        cutoff_str = f" since last commit ({time_ago_dt(cutoff)})" if cutoff else ""
+        print(f"\n{BOLD}PLANS{RESET}{DIM}{cutoff_str}{RESET}")
+        show_plans(plans, cutoff)
+
+        print(f"\n{'─' * 42}")
+        check_conflicts(plans)
+
+    elif cmd in ("help", "-h", "--help"):
+        print(__doc__)
+    else:
+        print(f"Unknown command: {cmd}")
+        print(__doc__)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
