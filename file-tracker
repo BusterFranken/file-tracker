@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""file-tracker: See which files Claude Code plans will edit, detect conflicts.
+"""file-tracker: See which Claude Code plans can be executed together.
 
-Shows only plans created since the last git commit in their project.
+Reads plans created since the last git commit in their project, then groups
+the ones that touch no common files, so you can run a whole group in parallel.
+Plans that overlap with every other plan are dropped from the overview.
 
 Usage:
-  file-tracker        Show plans and check for conflicts
+  file-tracker        Show plans and which can run together
   file-tracker help   Show this help
 """
 
@@ -233,6 +235,16 @@ def get_plans():
 # ── Display ──────────────────────────────────────────────────
 
 
+def label_for(i):
+    """Stable plan labels: A, B, ..., Z, AA, AB, ... (handles >26 plans)."""
+    s = ""
+    i += 1
+    while i > 0:
+        i, r = divmod(i - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
 def show_plans(plans, cutoff):
     if not plans:
         if cutoff:
@@ -242,7 +254,7 @@ def show_plans(plans, cutoff):
         return
 
     for i, (name, data) in enumerate(plans.items()):
-        label = chr(65 + i)
+        label = label_for(i)
         age = time_ago_dt(data["mtime"])
         title = data["title"]
         n = len(data["files"])
@@ -251,32 +263,76 @@ def show_plans(plans, cutoff):
             print(f"      {fp}")
 
 
-def check_conflicts(plans):
-    plan_files = {}
-    for i, (name, data) in enumerate(plans.items()):
-        label = chr(65 + i)
-        plan_files[label] = {
-            "basenames": {normalize_filename(fp) for fp in data["files"]},
-            "title": data["title"],
-        }
+def find_compatible_groups(plans):
+    """Maximal groups of plans that can all run together, + plans that can't.
 
-    if len(plan_files) >= 2:
-        plan_labels = sorted(plan_files.keys())
-        for i, l1 in enumerate(plan_labels):
-            for l2 in plan_labels[i + 1:]:
-                shared = plan_files[l1]["basenames"] & plan_files[l2]["basenames"]
-                t1 = plan_files[l1]["title"]
-                t2 = plan_files[l2]["title"]
-                if shared:
-                    print(f"\n  {RED}Plan [{l1}] + Plan [{l2}]: CONFLICT{RESET}")
-                    print(f"    {DIM}{t1}  +  {t2}{RESET}")
-                    print(f"    Shared: {', '.join(sorted(shared))}")
-                else:
-                    print(f"\n  {GREEN}Plan [{l1}] + Plan [{l2}]: No shared files — safe to run in parallel.{RESET}")
-    elif len(plan_files) == 1:
-        print(f"\n  {DIM}Only one plan — nothing to compare.{RESET}")
+    Two plans are compatible when they touch no common file (by basename). A
+    group is a set of plans that are *pairwise* compatible, so {A,B}, {B,C} and
+    {A,C} collapse into a single {A,B,C} when all three are mutually compatible.
+    Returns (groups, solo, titles): groups is a list of sorted label-lists
+    (largest first); solo lists plans compatible with no other (they must run
+    alone); titles maps each label to its plan title.
+    """
+    labels = [label_for(i) for i in range(len(plans))]
+    basenames, titles = {}, {}
+    for label, (name, data) in zip(labels, plans.items()):
+        basenames[label] = {normalize_filename(fp) for fp in data["files"]}
+        titles[label] = data["title"]
+
+    # Compatibility graph: an edge means the two plans share no file.
+    neighbors = {l: set() for l in labels}
+    for i, l1 in enumerate(labels):
+        for l2 in labels[i + 1:]:
+            if not (basenames[l1] & basenames[l2]):
+                neighbors[l1].add(l2)
+                neighbors[l2].add(l1)
+
+    # Bron–Kerbosch with pivoting: enumerate maximal cliques (groups where
+    # every member is compatible with every other member).
+    cliques = []
+
+    def expand(r, p, x):
+        if not p and not x:
+            cliques.append(r)
+            return
+        pivot = max(p | x, key=lambda v: len(neighbors[v] & p))
+        for v in list(p - neighbors[pivot]):
+            expand(r | {v}, p & neighbors[v], x & neighbors[v])
+            p = p - {v}
+            x = x | {v}
+
+    expand(set(), set(labels), set())
+
+    groups = sorted(
+        (sorted(c) for c in cliques if len(c) >= 2),
+        key=lambda g: (-len(g), g),
+    )
+    solo = sorted(next(iter(c)) for c in cliques if len(c) == 1)
+    return groups, solo, titles
+
+
+def show_compatible_groups(plans):
+    if len(plans) == 0:
+        print(f"\n  {DIM}No plans to compare.{RESET}\n")
+        return
+    if len(plans) == 1:
+        print(f"\n  {DIM}Only one plan — nothing to batch.{RESET}\n")
+        return
+
+    groups, solo, titles = find_compatible_groups(plans)
+
+    if groups:
+        for g in groups:
+            labels_str = " ".join(f"{MAGENTA}[{l}]{RESET}" for l in g)
+            titles_str = f"{DIM} · {RESET}".join(f"{DIM}{titles[l]}{RESET}" for l in g)
+            print(f"\n  {GREEN}●{RESET} {labels_str}  {DIM}({len(g)} plans){RESET}")
+            print(f"      {titles_str}")
     else:
-        print(f"\n  {DIM}No plans to compare.{RESET}")
+        print(f"\n  {DIM}No plans can run together — every pair shares a file.{RESET}")
+
+    if solo:
+        solo_str = ", ".join(f"[{l}]" for l in solo)
+        print(f"\n  {DIM}Dropped — must run alone (share files with all others): {solo_str}{RESET}")
 
     print()
 
@@ -299,7 +355,8 @@ def main():
         show_plans(plans, cutoff)
 
         print(f"\n{'─' * 42}")
-        check_conflicts(plans)
+        print(f"\n{BOLD}CAN RUN TOGETHER{RESET}{DIM}  (grouped — no shared files){RESET}")
+        show_compatible_groups(plans)
 
     elif cmd in ("help", "-h", "--help"):
         print(__doc__)

@@ -1,15 +1,15 @@
 # file-tracker
 
-A CLI tool that shows which files your [Claude Code](https://docs.anthropic.com/en/docs/claude-code) plans will edit, and checks for conflicts between them.
+A CLI tool that shows which files your [Claude Code](https://docs.anthropic.com/en/docs/claude-code) plans will edit, and groups the plans you can safely run together.
 
-When you're working with multiple Claude Code plans and want to run them in parallel, `file-tracker` tells you if they touch the same files — so you know whether it's safe.
+When you're working with multiple Claude Code plans and want to run them in parallel, `file-tracker` groups the ones that touch no common files — so you can see at a glance which plans you can run together.
 
 ## How it works
 
 1. Reads plan files from `~/.claude/plans/`
 2. Extracts file paths referenced in each plan
 3. Finds the relevant git repo and filters to only plans created **since the last commit**
-4. Compares file lists and reports conflicts
+4. Groups plans that share no files into sets you can run together in parallel
 
 ## Install
 
@@ -44,15 +44,23 @@ PLANS since last commit (1h ago)
 
 ──────────────────────────────────────────
 
-  Plan [A] + Plan [B]: No shared files — safe to run in parallel.
+CAN RUN TOGETHER  (grouped — no shared files)
+
+  ● [A] [B]  (2 plans)
+      Fix Muscle Balance card · Multi-Set Exercises
 ```
 
-When plans share files:
+Plans are grouped into **maximal sets that can all run together** — every plan in a group touches no file used by any other plan in that group. If `[A]`, `[B]` and `[C]` are all mutually compatible, they collapse into a single group instead of three pairwise lines:
 
 ```
-  Plan [A] + Plan [B]: CONFLICT
-    Fix layout  +  Add feature
-    Shared: WorkoutRepository.swift
+  ● [A] [B] [C]  (3 plans)
+      Fix layout · Add feature · Update docs
+```
+
+A plan that shares a file with *every* other plan can't join any group, so it's dropped from the overview with a one-line note:
+
+```
+  Dropped — must run alone (share files with all others): [D]
 ```
 
 ## How plans are filtered
