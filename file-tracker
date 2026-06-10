@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """file-tracker: See which Claude Code plans can be executed together.
 
-Reads plans created since the last git commit in their project, then groups
-the ones that touch no common files, so you can run a whole group in parallel.
-Plans that overlap with every other plan are dropped from the overview.
+Shows your open plans, then groups the ones that touch no common files so you
+can run a whole group in parallel. A plan is retired automatically once a
+commit implements it (a single commit changes most of the files it touches).
 
 Usage:
   file-tracker        Show plans and which can run together
@@ -19,6 +19,10 @@ from collections import defaultdict
 from pathlib import Path
 
 PLANS_DIR = Path.home() / ".claude" / "plans"
+
+# A plan is treated as "done" once a single commit (made after the plan was
+# written) changes at least this fraction of the files the plan touches.
+COMMITTED_COVERAGE = 0.6
 
 BOLD = "\033[1m"
 DIM = "\033[2m"
@@ -71,17 +75,56 @@ def discover_git_repos():
     return repos
 
 
-def get_last_commit_time(repo):
+def get_repo_commits(repo, days=90):
+    """Recent commits as a list of (epoch_seconds, {changed basenames}).
+
+    Covers the last `days` days, which is plenty to span the lifetime of any
+    plan still sitting in ~/.claude/plans.
+    """
     try:
         result = subprocess.run(
-            ["git", "-C", repo, "log", "-1", "--format=%cI"],
-            capture_output=True, text=True, timeout=5,
+            ["git", "-C", repo, "log", f"--since={days}.days",
+             "--no-renames", "--format=\x01%ct", "--name-only"],
+            capture_output=True, text=True, timeout=15,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            return datetime.fromisoformat(result.stdout.strip())
     except Exception:
-        pass
-    return None
+        return []
+    if result.returncode != 0:
+        return []
+
+    commits = []
+    ts = None
+    files = set()
+    for line in result.stdout.split("\n"):
+        if line.startswith("\x01"):
+            if ts is not None:
+                commits.append((ts, files))
+            ts, files = int(line[1:]), set()
+        elif line.strip() and ts is not None:
+            files.add(line.rsplit("/", 1)[-1])
+    if ts is not None:
+        commits.append((ts, files))
+    return commits
+
+
+def plan_is_completed(plan_basenames, plan_epoch, commits):
+    """True once a single commit after the plan changed most of its files.
+
+    We look at the *best* single commit rather than the union across commits:
+    one commit implementing the plan is a clean signal it shipped, whereas
+    shared files (worker.ts, webhook.ts, …) get touched by unrelated commits
+    and would otherwise retire a plan whose own work never landed.
+    """
+    if not plan_basenames:
+        return False
+    best = 0.0
+    for ts, changed in commits:
+        if ts <= plan_epoch:
+            continue
+        frac = len(plan_basenames & changed) / len(plan_basenames)
+        if frac > best:
+            best = frac
+    return best >= COMMITTED_COVERAGE
 
 
 def find_repo_for_files(files, repos):
@@ -179,18 +222,14 @@ def normalize_filename(path):
 
 def get_plans():
     if not PLANS_DIR.exists():
-        return {}, None
+        return {}, 0
 
     repos = discover_git_repos()
-
-    repo_commit_times = {}
-    for repo in repos:
-        t = get_last_commit_time(repo)
-        if t:
-            repo_commit_times[repo] = t
+    repo_commits = {repo: get_repo_commits(repo) for repo in repos}
 
     plans = {}
-    cutoff_used = None
+    hidden_done = 0
+    now = datetime.now(timezone.utc)
 
     all_plan_files = sorted(
         PLANS_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True
@@ -204,18 +243,14 @@ def get_plans():
             continue
 
         repo = find_repo_for_files(files, repos)
-        cutoff = repo_commit_times.get(repo) if repo else None
 
-        if cutoff:
-            if cutoff.tzinfo is None:
-                cutoff = cutoff.replace(tzinfo=timezone.utc)
-            if mtime <= cutoff:
+        if repo is not None:
+            basenames = {normalize_filename(fp) for fp in files}
+            if plan_is_completed(basenames, f.stat().st_mtime, repo_commits.get(repo, [])):
+                hidden_done += 1
                 continue
-            cutoff_used = cutoff
-        elif repo is None:
-            now = datetime.now(timezone.utc)
-            if (now - mtime).total_seconds() > 86400:
-                continue
+        elif (now - mtime).total_seconds() > 86400:
+            continue
 
         title = f.stem
         for line in content.split("\n"):
@@ -229,7 +264,7 @@ def get_plans():
             "mtime": mtime,
         }
 
-    return plans, cutoff_used
+    return plans, hidden_done
 
 
 # ── Display ──────────────────────────────────────────────────
@@ -245,12 +280,9 @@ def label_for(i):
     return s
 
 
-def show_plans(plans, cutoff):
+def show_plans(plans):
     if not plans:
-        if cutoff:
-            print(f"  {DIM}No plans since last commit ({time_ago_dt(cutoff)}).{RESET}")
-        else:
-            print(f"  {DIM}No plans with file references found.{RESET}")
+        print(f"  {DIM}No open plans found.{RESET}")
         return
 
     for i, (name, data) in enumerate(plans.items()):
@@ -345,14 +377,17 @@ def main():
     cmd = args[0] if args else "show"
 
     if cmd in ("show", "list", "ls"):
-        plans, cutoff = get_plans()
+        plans, hidden_done = get_plans()
 
         print(f"\n{BOLD}FILE TRACKER{RESET}")
         print("=" * 42)
 
-        cutoff_str = f" since last commit ({time_ago_dt(cutoff)})" if cutoff else ""
-        print(f"\n{BOLD}PLANS{RESET}{DIM}{cutoff_str}{RESET}")
-        show_plans(plans, cutoff)
+        hidden_str = (
+            f"  ({hidden_done} completed plan{'s' if hidden_done != 1 else ''} hidden)"
+            if hidden_done else ""
+        )
+        print(f"\n{BOLD}OPEN PLANS{RESET}{DIM}{hidden_str}{RESET}")
+        show_plans(plans)
 
         print(f"\n{'─' * 42}")
         print(f"\n{BOLD}CAN RUN TOGETHER{RESET}{DIM}  (grouped — no shared files){RESET}")

@@ -8,7 +8,7 @@ When you're working with multiple Claude Code plans and want to run them in para
 
 1. Reads plan files from `~/.claude/plans/`
 2. Extracts file paths referenced in each plan
-3. Finds the relevant git repo and filters to only plans created **since the last commit**
+3. Matches each plan to a git repo and retires any plan whose work has already landed in a commit
 4. Groups plans that share no files into sets you can run together in parallel
 
 ## Install
@@ -33,7 +33,7 @@ Example output:
 FILE TRACKER
 ==========================================
 
-PLANS since last commit (1h ago)
+OPEN PLANS  (3 completed plans hidden)
 
   [A] Fix Muscle Balance card  (3m ago, 1 file)
       Sources/WorkoutTrackerApp/Views/Tracking/TrackingView.swift
@@ -65,4 +65,8 @@ A plan that shares a file with *every* other plan can't join any group, so it's 
 
 ## How plans are filtered
 
-Only plans created after the last git commit in their project are shown. This means after you commit and start fresh, old plans disappear automatically. Plans that can't be matched to a git repo fall back to a 24-hour window.
+A plan is considered **done** — and hidden — once a single commit (made after the plan was written) changes at least 60% of the files that plan references. This retires a plan when its work actually lands, instead of wiping every plan the moment you make *any* commit in the repo.
+
+The threshold lives in `COMMITTED_COVERAGE` at the top of the script. It uses the *best single commit* rather than the union of all commits, so shared files (`worker.ts`, `webhook.ts`, …) that get touched by unrelated commits don't prematurely retire a plan whose own work never shipped.
+
+Plans that can't be matched to a git repo fall back to a 24-hour window.
